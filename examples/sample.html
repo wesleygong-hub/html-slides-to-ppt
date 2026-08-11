@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=1920,height=1080">
+  <title>HTML 转 PPT 示例</title>
+  <style>
+    * { box-sizing: border-box; }
+    html, body { margin: 0; width: 1920px; height: 1080px; overflow: hidden; font-family: "Microsoft YaHei", sans-serif; }
+    body { background: #111827; }
+    .slide { display: none; position: absolute; inset: 0; width: 1920px; height: 1080px; padding: 120px 140px; background: #f8fafc; color: #0f172a; }
+    .slide.active { display: block; }
+    h1 { margin: 0; max-width: 1400px; font-size: 112px; line-height: 1.08; }
+    h2 { margin: 0 0 70px; font-size: 72px; }
+    p { font-size: 38px; line-height: 1.6; color: #475569; }
+    .accent { width: 220px; height: 18px; margin: 48px 0; border-radius: 999px; background: #f97316; }
+    .dark { background: linear-gradient(135deg, #0f172a, #1e293b); color: white; }
+    .dark p { color: #cbd5e1; }
+    .metric { display: flex; gap: 48px; margin-top: 60px; }
+    .metric div { width: 360px; padding: 42px; border-radius: 28px; background: white; box-shadow: 0 24px 70px rgba(15, 23, 42, .12); }
+    .metric strong { display: block; color: #f97316; font-size: 76px; }
+    .metric span { color: #475569; font-size: 28px; }
+  </style>
+</head>
+<body>
+  <section class="slide active">
+    <h1>HTML Slides<br>可以高保真转成 PPT</h1>
+    <div class="accent"></div>
+    <p>浏览器负责还原 CSS，PowerPoint 负责承载最终画面。</p>
+  </section>
+  <section class="slide dark">
+    <h2>复杂视觉也能保留</h2>
+    <p>渐变、阴影、SVG、Canvas 和网页图表都会被渲染到最终页面。</p>
+    <div class="metric">
+      <div><strong>16:9</strong><span>标准宽屏 PPT</span></div>
+      <div><strong>100%</strong><span>本地运行</span></div>
+      <div><strong>1 click</strong><span>Windows 文件选择</span></div>
+    </div>
+  </section>
+  <script>
+    const slides = [...document.querySelectorAll(".slide")];
+    window.deck = {
+      showSlide(index) {
+        slides.forEach((slide, i) => slide.classList.toggle("active", i === index));
+      }
+    };
+  </script>
+</body>
+</html>

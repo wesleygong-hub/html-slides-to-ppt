@@ -1,5 +1,25 @@
 # 更新日志
 
+## 0.4.4 - 2026-08-18
+
+### 新功能
+
+- 新增 `data-html2ppt-reveal-from="auto|top|right|bottom|left"`，允许在已有入场动画的元素或其最近祖先上可靠指定展示方向；`auto` 可取消祖先覆盖并恢复自动推断。
+- 动画方向现在按“显式属性、关键帧与 `transform-origin`/`clip-path`、共同基线几何关系、安全回退”的顺序确定，不依赖文案关键词、网络或 AI。
+- 3 个以上共享祖先、底边或顶边对齐且高度差明显的阶梯/柱形，会沿共同基线向外增长；普通 Fade 不会因布局推断被擅自改成 Wipe。
+- 动画 manifest 增加 `revealFrom`、`directionReason` 和 `directionRequired`，命令行按方向及来源输出汇总。
+
+### 修复
+
+- 修复 `grow/scaleY` 从底部向上时错误写成 PowerPoint Wipe direction `1` 的问题，正确方向为 `3`。
+- PowerPoint 后处理在设置方向后继续恢复原时长与延迟，并对方向、时长、延迟进行 COM 回读；显式或确定性方向写入失败时转换会报错。
+
+### 验证
+
+- 新增 14 项 Node 单元测试，覆盖纵横缩放原点、四种 `clip-path: inset()`、显式覆盖、`auto`、非法值、正向/倒挂阶梯、误判保护及 Fade/折线/Wipe 回归。
+- 使用 Windows 桌面版 PowerPoint 转换四阶梯 fixture，确认 4 个效果均为 Wipe direction `3`、With Previous、0.8 秒且保存后回读一致。
+- 对动画开启与关闭的 PowerPoint 整页渲染 PNG 做逐字节比较，确认方向语义不会改变文字、位置、颜色或最终完整画面。
+
 ## 0.4.3 - 2026-08-12
 
 ### 优化

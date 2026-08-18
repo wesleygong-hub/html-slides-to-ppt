@@ -20,6 +20,8 @@ $manifest = Get-Content -LiteralPath $ManifestPath -Raw -Encoding UTF8 | Convert
 $powerPoint = $null
 $presentation = $null
 $applied = 0
+$verified = 0
+$timingTolerance = 0.02
 
 try {
     $powerPoint = New-Object -ComObject PowerPoint.Application
@@ -60,24 +62,53 @@ try {
                 0,
                 2
             )
-            if ([int]$effectSpec.direction -ne 0) {
+            $requestedDirection = [int]$effectSpec.direction
+            $directionRequired = [bool]$effectSpec.directionRequired
+            $directionWasSet = $false
+            if ($requestedDirection -ne 0) {
                 try {
-                    $effect.EffectParameters.Direction = [int]$effectSpec.direction
+                    $effect.EffectParameters.Direction = $requestedDirection
+                    $directionWasSet = $true
                 } catch {
-                    # Some PowerPoint effects expose no direction parameter.
-                    # The effect itself is still valid and should be retained.
+                    if ($directionRequired) {
+                        throw "Direction could not be set on slide $($slideSpec.slide), shape $($effectSpec.objectName): $($_.Exception.Message)"
+                    }
                 }
             }
             # Set timing after direction: PowerPoint resets an effect to its
             # preset duration whenever Direction changes.
             $effect.Timing.Duration = [single]$effectSpec.duration
             $effect.Timing.TriggerDelayTime = [single]$effectSpec.delay
+
+            # COM readback catches unsupported directions and PowerPoint preset
+            # resets before the presentation is saved.
+            if ($directionWasSet) {
+                try {
+                    $actualDirection = [int]$effect.EffectParameters.Direction
+                    if ($directionRequired -and $actualDirection -ne $requestedDirection) {
+                        throw "Direction verification failed: expected $requestedDirection, got $actualDirection"
+                    }
+                } catch {
+                    if ($directionRequired) {
+                        throw "Direction verification failed on slide $($slideSpec.slide), shape $($effectSpec.objectName): $($_.Exception.Message)"
+                    }
+                }
+            }
+            $actualDuration = [double]$effect.Timing.Duration
+            $actualDelay = [double]$effect.Timing.TriggerDelayTime
+            if ([Math]::Abs($actualDuration - [double]$effectSpec.duration) -gt $timingTolerance) {
+                throw "Duration verification failed on slide $($slideSpec.slide), shape $($effectSpec.objectName): expected $($effectSpec.duration), got $actualDuration"
+            }
+            if ([Math]::Abs($actualDelay - [double]$effectSpec.delay) -gt $timingTolerance) {
+                throw "Delay verification failed on slide $($slideSpec.slide), shape $($effectSpec.objectName): expected $($effectSpec.delay), got $actualDelay"
+            }
+            $verified++
             $applied++
         }
     }
 
     $presentation.Save()
-    Write-Output "$applied effects saved"
+    Write-Output "$applied effects saved, $verified verified"
 } finally {
     if ($null -ne $presentation) {
         try { $presentation.Close() } catch {}

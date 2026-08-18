@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=1920,height=1080">
+  <title>阶梯动画方向集成测试</title>
+  <style>
+    * { box-sizing: border-box; }
+    html, body { margin: 0; width: 1920px; height: 1080px; overflow: hidden; }
+    body { background: #f8fafc; }
+    .slide { position: relative; width: 1920px; height: 1080px; background: #f8fafc; }
+    .title { position: absolute; left: 210px; top: 90px; margin: 0; color: #172033; font: 700 64px/1.2 "Microsoft YaHei", sans-serif; }
+    .steps {
+      position: absolute;
+      left: 210px;
+      right: 210px;
+      bottom: 150px;
+      height: 700px;
+      display: flex;
+      align-items: flex-end;
+      gap: 24px;
+    }
+    .step {
+      width: 351px;
+      background: #ef233c;
+      animation: stage-reveal 800ms cubic-bezier(.2, .8, .2, 1) both;
+    }
+    .step:nth-child(1) { height: 250px; background: #f8c2ca; }
+    .step:nth-child(2) { height: 370px; background: #f28b9a; }
+    .step:nth-child(3) { height: 500px; background: #ee4d64; }
+    .step:nth-child(4) { height: 650px; }
+    @keyframes stage-reveal {
+      from { transform: scaleY(0); }
+      to { transform: scaleY(1); }
+    }
+  </style>
+</head>
+<body>
+  <section class="slide">
+    <h1 class="title">我们的服务在长</h1>
+    <div class="steps">
+      <div class="step"></div>
+      <div class="step"></div>
+      <div class="step"></div>
+      <div class="step"></div>
+    </div>
+  </section>
+</body>
+</html>

@@ -9,6 +9,11 @@ import { promisify } from "node:util";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { chromium } from "playwright";
 import pptxgen from "pptxgenjs";
+import {
+  applyAnimationSemantics,
+  mapHtmlEffectToPowerPoint,
+  summarizeAnimationDirections,
+} from "./animation-semantics.mjs";
 
 const execFileAsync = promisify(execFile);
 
@@ -268,8 +273,8 @@ async function activateSlide(page, info, index) {
   );
 }
 
-async function extractSlideAnimations(page, info, index) {
-  return page.evaluate(
+async function extractSlideAnimations(page, info, index, animationMode) {
+  const captured = await page.evaluate(
     async ({ selector, index: targetIndex }) => {
       const slide = document.querySelectorAll(selector)[targetIndex];
       if (!slide) return [];
@@ -283,6 +288,11 @@ async function extractSlideAnimations(page, info, index) {
       await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
 
       const elements = Array.from(slide.querySelectorAll("*"));
+      const slideRect = slide.getBoundingClientRect();
+      const nodes = [slide, ...elements];
+      const nodeIds = new WeakMap(nodes.map((element, nodeIndex) => (
+        [element, `html2ppt-node-${targetIndex + 1}-${nodeIndex + 1}`]
+      )));
       const finalSnapshots = new Map();
       const milliseconds = (value) => {
         const text = String(value || "0s").trim().toLowerCase();
@@ -305,6 +315,23 @@ async function extractSlideAnimations(page, info, index) {
         width: style.width,
         height: style.height,
       });
+      const elementLabel = (element) => {
+        const tag = element.tagName?.toLowerCase?.() || "element";
+        const id = element.id ? `#${element.id}` : "";
+        const classes = Array.from(element.classList || []).slice(0, 3).map((name) => `.${name}`).join("");
+        return `${tag}${id}${classes}`;
+      };
+      const revealHint = (element) => {
+        let current = element;
+        while (current && current !== slide.parentElement) {
+          if (current.hasAttribute?.("data-html2ppt-reveal-from")) {
+            const raw = current.getAttribute("data-html2ppt-reveal-from") ?? "";
+            return { raw, value: raw.trim().toLowerCase(), owner: elementLabel(current) };
+          }
+          current = current.parentElement;
+        }
+        return null;
+      };
 
       for (const element of elements) {
         const style = getComputedStyle(element);
@@ -445,12 +472,60 @@ async function extractSlideAnimations(page, info, index) {
         if (!effects.length) continue;
         const id = `html2ppt-animation-${targetIndex + 1}-${++sequence}`;
         element.setAttribute("data-html2ppt-animation-id", id);
-        results.push({ id, effects });
+        const finalAnimatedTransform = effects
+          .flatMap((effect) => effect.keyframes || [])
+          .map((frame) => frame?.transform)
+          .filter((value) => value !== undefined && value !== null && value !== "")
+          .at(-1);
+        const previousTransform = element.style.getPropertyValue("transform");
+        const previousTransformPriority = element.style.getPropertyPriority("transform");
+        if (finalAnimatedTransform !== undefined) {
+          element.style.setProperty("transform", finalAnimatedTransform || "none", "important");
+        }
+        const rect = element.getBoundingClientRect();
+        if (finalAnimatedTransform !== undefined) {
+          if (previousTransform) {
+            element.style.setProperty("transform", previousTransform, previousTransformPriority);
+          } else {
+            element.style.removeProperty("transform");
+          }
+        }
+        const ancestorChain = [];
+        let ancestor = element.parentElement;
+        while (ancestor && slide.contains(ancestor)) {
+          ancestorChain.push(nodeIds.get(ancestor));
+          if (ancestor === slide) break;
+          ancestor = ancestor.parentElement;
+        }
+        results.push({
+          id,
+          effects,
+          metadata: {
+            rect: {
+              x: rect.left - slideRect.left,
+              y: rect.top - slideRect.top,
+              w: rect.width,
+              h: rect.height,
+            },
+            slideSize: { width: slideRect.width, height: slideRect.height },
+            transformOrigin: getComputedStyle(element).transformOrigin,
+            ancestorChain,
+            revealHint: revealHint(element),
+            elementLabel: elementLabel(element),
+          },
+        });
       }
       return results;
     },
     { selector: info.selector, index },
   );
+  const semanticResult = applyAnimationSemantics(captured, {
+    slideIndex: index + 1,
+    mode: animationMode,
+  });
+  for (const warning of semanticResult.warnings) console.warn(`动画提示：${warning}`);
+  if (semanticResult.errors.length) throw new Error(semanticResult.errors.join("；"));
+  return semanticResult.animations;
 }
 
 async function finishSlideMotion(page, info, index, waitMs) {
@@ -1326,70 +1401,6 @@ function safeFileStem(filePath) {
   return path.basename(filePath, path.extname(filePath)).replace(/[<>:"/\\|?*]+/g, "-");
 }
 
-function matrixTranslation(transform) {
-  const match = String(transform || "").match(/matrix(?:3d)?\(([^)]+)\)/i);
-  if (!match) return { x: 0, y: 0 };
-  const values = match[1].split(",").map((value) => Number.parseFloat(value.trim()));
-  if (values.length === 6 && values.every(Number.isFinite)) return { x: values[4], y: values[5] };
-  if (values.length === 16 && values.every(Number.isFinite)) return { x: values[12], y: values[13] };
-  return { x: 0, y: 0 };
-}
-
-function mapHtmlEffectToPowerPoint(effect) {
-  const name = String(effect.name || "").toLowerCase();
-  const keyframes = Array.isArray(effect.keyframes) ? effect.keyframes : [];
-  const transforms = keyframes.map((frame) => String(frame.transform || ""));
-  const transformText = transforms.join(" ").toLowerCase();
-  const properties = (effect.properties || []).join(" ").toLowerCase();
-  const changedKeyframeProperty = (property) => {
-    const values = keyframes
-      .map((frame) => String(frame[property] ?? "").trim().toLowerCase())
-      .filter(Boolean);
-    return values.length >= 2 && new Set(values).size > 1;
-  };
-  const firstTranslation = matrixTranslation(transforms[0]);
-  const lastTranslation = matrixTranslation(transforms.at(-1));
-  const dx = firstTranslation.x - lastTranslation.x;
-  const dy = firstTranslation.y - lastTranslation.y;
-
-  let effectType = 10; // msoAnimEffectFade
-  let direction = 0;
-  if (/draw|stroke/.test(name) || changedKeyframeProperty("strokeDashoffset")) {
-    effectType = 22; // msoAnimEffectWipe
-    direction = 4; // msoAnimDirectionLeft (from left)
-  } else if (/grow|scale.?y/.test(`${name} ${transformText}`)) {
-    effectType = 22;
-    direction = 1; // msoAnimDirectionUp (reveal from bottom toward top)
-  } else if (/spin|rotate/.test(`${name} ${transformText}`)) {
-    effectType = 61; // msoAnimEffectSpin
-  } else if (/zoom|scale/.test(`${name} ${transformText}`)) {
-    effectType = 48; // msoAnimEffectFadedZoom
-  } else if (Math.abs(dy) > 0.5 || /translatey/.test(transformText)) {
-    // Vertical floating entrances can feel distracting in business decks.
-    // Keep their HTML timing, but express them as a restrained Fade.
-    effectType = 10; // msoAnimEffectFade
-    direction = 0;
-  } else if (Math.abs(dx) > 0.5 || /translatex/.test(transformText)) {
-    effectType = 2; // msoAnimEffectFly
-    direction = dx >= 0 ? 2 : 4; // from right / from left
-  } else if (properties.includes("transform")) {
-    effectType = 10;
-    direction = 0;
-  } else if (/clip|wipe/.test(`${name} ${properties}`)) {
-    effectType = 22;
-    direction = 4;
-  }
-
-  return {
-    effectType,
-    direction,
-    duration: Math.max(0.05, Math.min(30, (Number(effect.duration) || 500) / 1000)),
-    delay: Math.max(0, Math.min(30, (Number(effect.delay) || 0) / 1000)),
-    sourceType: effect.type || "animation",
-    sourceName: effect.name || "unnamed",
-  };
-}
-
 function representativeAnimationScore(effect) {
   const source = String(effect.sourceName || "").toLowerCase();
   // A flattened SVG/canvas can contain many independently animated children,
@@ -1443,7 +1454,7 @@ function buildAnimationManifest(frames) {
     totalEffects += effects.length;
     return { slide: slideIndex + 1, effects };
   });
-  return { version: 1, totalEffects, slides };
+  return { version: 2, totalEffects, slides };
 }
 
 async function applyPowerPointAnimations(outputPath, manifest, mode) {
@@ -1543,7 +1554,7 @@ async function main() {
     for (let index = 0; index < info.count; index += 1) {
       await activateSlide(page, info, index);
       const animations = captureAnimations
-        ? await extractSlideAnimations(page, info, index)
+        ? await extractSlideAnimations(page, info, index, opts.animations)
         : [];
       await finishSlideMotion(page, info, index, opts.wait);
       const slideElement = page.locator(info.selector).nth(index);
@@ -1695,6 +1706,8 @@ async function main() {
     await pptx.writeFile({ fileName: outputPath, compression: true });
     if (captureAnimations) {
       const animationManifest = buildAnimationManifest(frames);
+      const directionSummary = summarizeAnimationDirections(animationManifest);
+      if (directionSummary) console.log(`动画方向：${directionSummary}`);
       await applyPowerPointAnimations(outputPath, animationManifest, opts.animations);
     }
     console.log(`完成：${outputPath}`);

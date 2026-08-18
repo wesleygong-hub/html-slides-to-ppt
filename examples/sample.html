@@ -17,9 +17,12 @@
     .dark { background: linear-gradient(135deg, #0f172a, #1e293b); color: white; }
     .dark p { color: #cbd5e1; }
     .metric { display: flex; gap: 48px; margin-top: 60px; }
-    .metric div { width: 360px; padding: 42px; border-radius: 28px; background: white; box-shadow: 0 24px 70px rgba(15, 23, 42, .12); }
+    .metric div { width: 360px; padding: 42px; border-radius: 28px; background: white; box-shadow: 0 24px 70px rgba(15, 23, 42, .12); transform-origin: bottom; animation: metric-grow .7s ease-out both; }
+    .metric div:nth-child(2) { animation-delay: .12s; }
+    .metric div:nth-child(3) { animation-delay: .24s; }
     .metric strong { display: block; color: #f97316; font-size: 76px; }
     .metric span { color: #475569; font-size: 28px; }
+    @keyframes metric-grow { from { transform: scaleY(0); } to { transform: scaleY(1); } }
   </style>
 </head>
 <body>
@@ -31,7 +34,7 @@
   <section class="slide dark">
     <h2>复杂视觉也能保留</h2>
     <p>渐变、阴影、SVG、Canvas 和网页图表都会被渲染到最终页面。</p>
-    <div class="metric">
+    <div class="metric" data-html2ppt-reveal-from="bottom">
       <div><strong>16:9</strong><span>标准宽屏 PPT</span></div>
       <div><strong>100%</strong><span>本地运行</span></div>
       <div><strong>1 click</strong><span>Windows 文件选择</span></div>

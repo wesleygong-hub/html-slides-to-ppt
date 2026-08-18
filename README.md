@@ -83,11 +83,30 @@ node convert.mjs -i demo.html --selector ".deck-page"
 - HTML 最好使用固定 16:9 画布，例如 `1920×1080` 或 `1280×720`。
 - 网络字体和远程图片会受网络影响；交付前建议把字体和图片放到 HTML 同目录。
 - 默认采集 CSS Transition、CSS Animation 和 Web Animations 的时长、延迟及关键帧，并在生成对象后写入原生 PowerPoint 时间轴。
+- 动画方向默认按 CSS 关键帧、`transform-origin`、`clip-path` 和页面几何关系确定。具有共同基线且逐级升高的 3 个以上阶梯或柱形，会从基线向上展开；无法取得更多证据的 `grow/scaleY` 也安全回退为从底部向上。
 - 原生动画后处理需要 Windows 桌面版 Microsoft PowerPoint。默认 `auto` 模式在 PowerPoint 不可用时仍会输出静态 PPT；交付前必须确保动画存在时可使用 `--animations required`。
 - `--animations off` 会恢复为只保留最终静态状态；动态数据尚未稳定时，仍可用 `--wait` 增加等待时间。
 - `file://` 页面若访问了浏览器禁止的跨域资源，应改为本地相对路径或内嵌资源。
 - 默认使用 `--scale 2`：1920×1080 页面按 3840×2160 捕获，SVG、Canvas、网页图表、照片和页面底图的像素尺寸同步翻倍，放大查看时更清晰。
 - 对清晰度要求特别高且可以接受更大文件时，可使用 `--scale 3` 或 `--scale 4`；超长 deck 或文件大小优先时使用 `--scale 1`。
+
+## 指定动画展示方向
+
+转换器通常会自动判断方向。复杂布局可在已有入场动画的元素或其祖先上增加：
+
+```html
+<div class="steps" data-html2ppt-reveal-from="bottom">
+  <div class="step"></div>
+  <div class="step"></div>
+  <div class="step"></div>
+</div>
+```
+
+`data-html2ppt-reveal-from` 支持 `auto`、`top`、`right`、`bottom`、`left`。这里的边表示内容最先出现的边，例如 `bottom` 会从底边向上展开。最近元素或祖先上的值优先；子元素使用 `auto` 可取消祖先指定并恢复自动推断。该属性只调整已经存在的有限入场动画，不会为静态元素创建动画；显式边缘用于原本不支持方向的入场效果时，会转换为 Wipe。
+
+PowerPoint Wipe 的方向映射为 `top → 1`、`right → 2`、`bottom → 3`、`left → 4`。非法属性在默认 `auto` 模式下会警告并回退自动推断，在 `--animations required` 下会终止转换并指出页码和元素。
+
+可运行 `npm test` 执行跨平台语义单测；Windows 已安装桌面版 PowerPoint 时，运行 `npm run test:powerpoint` 会转换最小阶梯样例，并回读方向、时长、延迟与触发方式，再比较动画版和静态版的 PowerPoint 整页渲染。
 
 ## 对象模式的可编辑范围
 

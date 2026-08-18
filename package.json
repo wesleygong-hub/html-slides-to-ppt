@@ -1,6 +1,6 @@
 {
   "name": "html-slides-to-ppt",
-  "version": "0.4.3",
+  "version": "0.4.4",
   "private": true,
   "type": "module",
   "description": "Convert local HTML slide decks to high-fidelity PPTX files with editable text, shapes, and separate visual objects on Windows.",
@@ -9,7 +9,9 @@
   },
   "scripts": {
     "convert": "node convert.mjs",
-    "install-browser": "playwright install chromium"
+    "install-browser": "playwright install chromium",
+    "test": "node --test tests/animation-semantics.test.mjs",
+    "test:powerpoint": "node --test tests/powerpoint-integration.test.mjs"
   },
   "dependencies": {
     "playwright": "^1.62.1",

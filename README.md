@@ -21,6 +21,18 @@
 - `editable`：复杂视觉合并成一张高保真背景，文字为独立文本框。适合只改文字、优先追求视觉一致性的情况。
 - `image`：每页作为一张整页图片，视觉最稳定，但页面内容不可编辑。
 
+### 视觉一致性优先
+
+如果交付要求是“保留浏览器最终画面、不因对方电脑缺字体而变形”，使用整页高清图片模式：
+
+```powershell
+node convert.mjs -i demo.html -o demo-fidelity.pptx --mode image --scale 2 --animations off --keep-images
+```
+
+该模式不保留可编辑文字或页面内动画。`objects` / `editable` 使用 PowerPoint 自身的排版引擎，无法承诺任意 HTML 在完全可编辑的同时像素级一致；需要接收方安装相同字体，字体字重、字距和复杂裁切仍应逐页核对。建议重要交付同时生成可编辑版与静态保真版。
+
+`--keep-images` 在所有模式下保存**完整浏览器最终画面**，不是移除文字或视觉对象后的底图，可与 PowerPoint 导出的逐页图片对照。
+
 ## 命令行使用
 
 ```powershell
@@ -78,10 +90,18 @@ node convert.mjs -i demo.html --selector ".deck-page"
 
 程序也兼容常见的 JavaScript 切页方式，包括 Reveal.js、`deck.showSlide(i)`、`deck.show(i)`、全局 `showSlide(i)`，以及通过 `active`、`present` 或 `visible` 类名显示页面的自定义 deck。
 
+页面外的导航按钮和交互浮层会在捕获时隐藏；透明且不响应鼠标的装饰覆盖层会保留。对自定义控件，也可显式加上 `data-html2ppt-ignore`，仅从导出中排除，不修改源 HTML：
+
+```html
+<button data-html2ppt-ignore>下一页</button>
+```
+
 ## 转换建议
 
 - HTML 最好使用固定 16:9 画布，例如 `1920×1080` 或 `1280×720`。
 - 网络字体和远程图片会受网络影响；交付前建议把字体和图片放到 HTML 同目录。
+- 可编辑模式按本机实际安装字体解析 HTML 字体栈，字体替换会在命令行提示；保留已安装的 `Noto Serif SC` / `Noto Sans SC`，不会因名称中的 `Serif` 被错误映射为宋体。网页能加载字体不代表 PowerPoint 已安装该字体，本工具不自动嵌入字体。
+- 固定画布通过父级 `transform: scale()` 缩放时，字号、字距、边框和圆角与坐标使用相同倍率；同行的连续强调文字会合并为保留各段颜色与字重的富文本框。
 - 默认采集 CSS Transition、CSS Animation 和 Web Animations 的时长、延迟及关键帧，并在生成对象后写入原生 PowerPoint 时间轴。
 - 动画方向默认按 CSS 关键帧、`transform-origin`、`clip-path` 和页面几何关系确定。具有共同基线且逐级升高的 3 个以上阶梯或柱形，会从基线向上展开；无法取得更多证据的 `grow/scaleY` 也安全回退为从底部向上。
 - 原生动画后处理需要 Windows 桌面版 Microsoft PowerPoint。默认 `auto` 模式在 PowerPoint 不可用时仍会输出静态 PPT；交付前必须确保动画存在时可使用 `--animations required`。
@@ -112,7 +132,7 @@ PowerPoint Wipe 的方向映射为 `top → 1`、`right → 2`、`bottom → 3`�
 
 - 纯色矩形、圆角矩形、圆形、边框和线条：PowerPoint 原生形状，可改颜色、大小、位置和边框。
 - 圆角矩形会按 HTML 的实际 `border-radius` 换算为 PowerPoint 圆角参数，不使用 PowerPoint 偏大的默认圆角。
-- CSS `::before` / `::after` 生成的装饰条、圆点、进度条等也会被物化为独立 PowerPoint 对象，不再残留在页面底图中。
+- CSS `::before` / `::after` 中的文本、列表圆点会参与文字提取；空内容装饰与父级背景一起捕获，保留圆角与 `overflow:hidden` 裁切关系，避免径向渐变被拆成越界方块。此类装饰不再保证单独可编辑。
 - CSS 边框绘制的三角形、箭头尖端和方向指示符会自动识别朝向，并转换为可单独编辑的 PowerPoint 原生三角形。
 - 透明 SVG、Canvas 和 PNG 在截取为独立图片对象时，会继承最近的纯色父级底色，避免透明区域错误带入页面灰底。
 - 程序会自动区分“纯媒体裁剪容器”和“包含正文、卡片、图表的复合内容容器”。`overflow:hidden`、圆角或遮罩不会再导致整块内容误合并；复合区域中的卡片、SVG、Canvas 和色块会按 DOM 结构自主拆分。
@@ -125,3 +145,15 @@ PowerPoint Wipe 的方向映射为 `top → 1`、`right → 2`、`bottom → 3`�
 - SVG 或 Canvas 内部无法成为独立 PPT 对象的子节点动画，会汇总并选择一个最具代表性的效果应用到对应图片对象，路径绘制和图表增长优先于普通淡入。这样可避免同一张完整图片先淡入、再擦除或因多个子节点而反复入场。
 - PowerPoint 与浏览器的字体排版引擎不同，极复杂页面可能出现轻微字距或字号差异。
 - 视频、音频、无限循环装饰动画和无法识别的复杂交互仍会保留为转换时的静态画面。
+
+## 布局回归验证
+
+```powershell
+npm test
+npm run test:layout
+npm run test:powerpoint
+```
+
+`test:layout` 使用 `tests/fixtures/scaled-layout.html`，在 1280×720、1920×1080 两种视口检查缩放、连续文字、伪元素裁切、透明背景及页面外控件隔离；Windows 使用 Edge，其他平台需要 Playwright Chromium。`test:powerpoint` 需要 Windows 桌面版 PowerPoint。
+
+可用 `tests/inspect-render-ppt.ps1 -PptxPath <文件> -OutputDirectory <目录>` 只读导出全部页 PNG，并输出页数、对象、字体字号和动画数量，供交付检查。

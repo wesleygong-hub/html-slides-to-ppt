@@ -10,7 +10,8 @@
   "scripts": {
     "convert": "node convert.mjs",
     "install-browser": "playwright install chromium",
-    "test": "node --test tests/animation-semantics.test.mjs",
+    "test": "node --test tests/animation-semantics.test.mjs tests/capture-semantics.test.mjs",
+    "test:layout": "node --test tests/capture-layout.test.mjs",
     "test:powerpoint": "node --test tests/powerpoint-integration.test.mjs"
   },
   "dependencies": {

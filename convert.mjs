@@ -9,6 +9,7 @@ import { promisify } from "node:util";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { chromium } from "playwright";
 import pptxgen from "pptxgenjs";
+import { installCaptureHelpers, prepareCapturePage, resolveFontFace, mergeInlineTextBlocks } from "./capture-semantics.mjs";
 import {
   applyAnimationSemantics,
   mapHtmlEffectToPowerPoint,
@@ -16,6 +17,21 @@ import {
 } from "./animation-semantics.mjs";
 
 const execFileAsync = promisify(execFile);
+let installedFonts = null;
+const fontSubstitutions = new Map();
+
+async function discoverInstalledFonts() {
+  if (process.platform !== "win32") return null;
+  try {
+    const { stdout } = await execFileAsync("powershell.exe", ["-NoProfile", "-Command",
+      "Add-Type -AssemblyName System.Drawing; $fonts = New-Object System.Drawing.Text.InstalledFontCollection; @($fonts.Families | ForEach-Object { $_.Name }) | ConvertTo-Json -Compress"],
+    { windowsHide: true, timeout: 15000 });
+    return JSON.parse(stdout.replace(/^\uFEFF/, ""));
+  } catch {
+    console.warn("字体提示：无法枚举本机字体，将保留 HTML 指定字体；跨设备请使用 image 模式保证字形。");
+    return null;
+  }
+}
 
 const HELP = `
 HTML Slides to PPT
@@ -225,7 +241,7 @@ async function detectSlides(page, requestedSelector) {
   throw new Error("没有找到幻灯片。可通过 --selector 指定每一页的 CSS 选择器。");
 }
 
-async function activateSlide(page, info, index) {
+export async function activateSlide(page, info, index) {
   await page.evaluate(
     ({ selector, framework, index: targetIndex }) => {
       const slides = Array.from(document.querySelectorAll(selector));
@@ -249,6 +265,19 @@ async function activateSlide(page, info, index) {
       if (typeof globalThis.showSlide === "function") {
         globalThis.showSlide(targetIndex);
         return;
+      }
+
+      // Generic horizontal tracks often use a controller with an unknown name.
+      // Hiding inactive siblings changes their widths, so reset only the common
+      // translated track while preserving each slide's flex/grid display.
+      const parent = target.parentElement;
+      if (parent && slides.every((slide) => slide.parentElement === parent)) {
+        const style = getComputedStyle(parent);
+        const matrix = new DOMMatrixReadOnly(style.transform === "none" ? undefined : style.transform);
+        if (style.display === "flex" && (Math.abs(matrix.m41) > 0.1 || Math.abs(matrix.m42) > 0.1)) {
+          parent.style.setProperty("transition", "none", "important");
+          parent.style.setProperty("transform", `matrix(${matrix.a},${matrix.b},${matrix.c},${matrix.d},0,0)`, "important");
+        }
       }
 
       slides.forEach((slide, slideIndex) => {
@@ -528,7 +557,7 @@ async function extractSlideAnimations(page, info, index, animationMode) {
   return semanticResult.animations;
 }
 
-async function finishSlideMotion(page, info, index, waitMs) {
+export async function finishSlideMotion(page, info, index, waitMs) {
   await page.waitForTimeout(waitMs);
   await page.evaluate(
     ({ selector, index: targetIndex }) => {
@@ -547,7 +576,7 @@ async function finishSlideMotion(page, info, index, waitMs) {
   await page.waitForTimeout(60);
 }
 
-async function installCleanCaptureStyle(page) {
+export async function installCleanCaptureStyle(page) {
   await page.addStyleTag({
     content: `
       html[data-html2ppt-clean="1"] [data-html2ppt-hide-text="1"] {
@@ -576,6 +605,10 @@ async function installCleanCaptureStyle(page) {
         box-shadow: none !important;
         outline-color: transparent !important;
       }
+      html[data-html2ppt-objects-clean="1"] [data-html2ppt-hide-box="1"]::before,
+      html[data-html2ppt-objects-clean="1"] [data-html2ppt-hide-box="1"]::after {
+        visibility: hidden !important;
+      }
       html[data-html2ppt-objects-clean="1"] [data-html2ppt-hide-object="1"] {
         visibility: hidden !important;
       }
@@ -602,8 +635,8 @@ async function installCleanCaptureStyle(page) {
   });
 }
 
-async function extractEditableText(page, info, index) {
-  return page.evaluate(
+export async function extractEditableText(page, info, index) {
+  const result = await page.evaluate(
     ({ selector, index: targetIndex }) => {
       const slide = document.querySelectorAll(selector)[targetIndex];
       if (!slide) return { slideRect: null, textBlocks: [] };
@@ -612,6 +645,18 @@ async function extractEditableText(page, info, index) {
       const blocks = [];
       const marked = new Set();
       let sequence = 0;
+      const flowIds = new WeakMap();
+      let flowSequence = 0;
+      const flowId = (element) => {
+        let current = element;
+        while (current !== slide && getComputedStyle(current).display === "inline") {
+          const parent = current.parentElement;
+          if (!parent || /flex|grid/.test(getComputedStyle(parent).display)) break;
+          current = parent;
+        }
+        if (!flowIds.has(current)) flowIds.set(current, ++flowSequence);
+        return flowIds.get(current);
+      };
 
       const animationRefs = (element) => {
         const refs = [];
@@ -662,7 +707,8 @@ async function extractEditableText(page, info, index) {
         if (effectiveOpacity(element) < 0.01) continue;
         if (style.backgroundClip === "text" || style.webkitBackgroundClip === "text") continue;
 
-        const fontSize = Number.parseFloat(style.fontSize) || 16;
+        const geometry = globalThis.__html2pptGeometry(element);
+        const fontSize = (Number.parseFloat(style.fontSize) || 16) * geometry.scaleY;
         const range = document.createRange();
         const chars = [];
         for (let charIndex = 0; charIndex < original.length; charIndex += 1) {
@@ -688,21 +734,19 @@ async function extractEditableText(page, info, index) {
         }
 
         for (const line of lines) {
-          const rawText = line.items.map((item) => item.char).join("").replace(/\s+/g, " ").trim();
-          if (!rawText) continue;
+          const rawText = line.items.map((item) => item.char).join("").replace(/\s+/g, " ");
+          if (!rawText.trim()) continue;
           const visibleItems = line.items.filter((item) => item.char.trim());
           if (!visibleItems.length) continue;
           const left = Math.min(...visibleItems.map((item) => item.rect.left));
           const top = Math.min(...visibleItems.map((item) => item.rect.top));
           const right = Math.max(...visibleItems.map((item) => item.rect.right));
           const bottom = Math.max(...visibleItems.map((item) => item.rect.bottom));
-          const matrix = new DOMMatrixReadOnly(style.transform === "none" ? undefined : style.transform);
-          const rotation = Math.abs(matrix.b) > 0.0001 || Math.abs(matrix.a - 1) > 0.0001
-            ? Math.atan2(matrix.b, matrix.a) * 180 / Math.PI
-            : 0;
+          const rotation = geometry.rotation;
           blocks.push({
             id: `html2ppt-text-${targetIndex + 1}-${++sequence}`,
-            text: transformedText(rawText, style.textTransform),
+            text: transformedText(rawText.trim(), style.textTransform),
+            flowId: flowId(element),
             x: left - slideRect.left,
             y: top - slideRect.top,
             w: right - left,
@@ -712,8 +756,9 @@ async function extractEditableText(page, info, index) {
             fontWeight: style.fontWeight || "400",
             fontStyle: style.fontStyle || "normal",
             color: rgb(style.color),
+            opacity: effectiveOpacity(element),
             align: style.textAlign || "left",
-            letterSpacing: Number.parseFloat(style.letterSpacing) || 0,
+            letterSpacing: (Number.parseFloat(style.letterSpacing) || 0) * geometry.scaleX,
             rotation,
             animationRefs: animationRefs(element),
           });
@@ -730,9 +775,11 @@ async function extractEditableText(page, info, index) {
     },
     { selector: info.selector, index },
   );
+  result.textBlocks = mergeInlineTextBlocks(result.textBlocks);
+  return result;
 }
 
-async function extractVisualObjects(page, info, index) {
+export async function extractVisualObjects(page, info, index) {
   return page.evaluate(
     ({ selector, index: targetIndex }) => {
       const slide = document.querySelectorAll(selector)[targetIndex];
@@ -834,12 +881,20 @@ async function extractVisualObjects(page, info, index) {
           const content = String(pseudoStyle.content || "").trim().toLowerCase();
           if (content === "none" || content === "normal" || pseudoStyle.display === "none"
             || pseudoStyle.visibility === "hidden" || Number.parseFloat(pseudoStyle.opacity || "1") < 0.01) continue;
+          // Decorative pseudo-elements belong to the parent's background and
+          // clipping context. Detached pictures lose overflow/radial alpha.
+          if (content === '""' || content === "''") continue;
           const clone = document.createElement("span");
           clone.setAttribute("aria-hidden", "true");
           clone.setAttribute("data-html2ppt-pseudo-clone", pseudo);
           for (const property of pseudoStyle) {
             clone.style.setProperty(property, pseudoStyle.getPropertyValue(property), pseudoStyle.getPropertyPriority(property));
           }
+          const rawContent = pseudoStyle.content;
+          clone.textContent = rawContent.replace(/^['"]|['"]$/g, "")
+            .replace(/\\([0-9a-f]{1,6})\s?/gi, (_, code) => String.fromCodePoint(Number.parseInt(code, 16)))
+            .replace(/\\([\\'"])/g, "$1");
+          clone.style.setProperty("content", "normal", "important");
           clone.style.setProperty("animation", "none", "important");
           clone.style.setProperty("transition", "none", "important");
           clone.style.setProperty("pointer-events", "none", "important");
@@ -925,6 +980,7 @@ async function extractVisualObjects(page, info, index) {
         if (element.closest("svg") && tag !== "svg") continue;
         if (Array.from(assetRoots).some((root) => root !== element && root.contains(element))) continue;
         const style = getComputedStyle(element);
+        const geometry = globalThis.__html2pptGeometry(element);
         const opacity = effectiveOpacity(element);
         if (opacity < 0.01 || style.display === "contents") continue;
         const rect = element.getBoundingClientRect();
@@ -949,7 +1005,10 @@ async function extractVisualObjects(page, info, index) {
           bottom: border(style, "Bottom"),
           left: border(style, "Left"),
         };
-        for (const item of Object.values(borders)) item.alpha *= opacity;
+        for (const [side, item] of Object.entries(borders)) {
+          item.alpha *= opacity;
+          item.width *= ["left", "right"].includes(side) ? geometry.scaleX : geometry.scaleY;
+        }
         // CSS commonly draws arrowheads and carets with a zero-content box:
         // one opaque border forms the triangular face while the two adjacent
         // borders are transparent. Treat that pattern as geometry instead of
@@ -984,16 +1043,19 @@ async function extractVisualObjects(page, info, index) {
         const hasFill = fill.alpha > 0.01;
         const hasBackgroundImage = backgroundImage !== "none";
         const hasShadow = style.boxShadow && style.boxShadow !== "none";
-        if (!asset && !hasFill && !hasBorder && !hasBackgroundImage && !hasShadow) continue;
+        const hasDecoration = ["::before", "::after"].some((pseudo) => {
+          const css = getComputedStyle(element, pseudo);
+          return (css.content === '""' || css.content === "''") && css.display !== "none"
+            && (css.backgroundImage !== "none" || color(css.backgroundColor).alpha > 0.01
+              || ["Top", "Right", "Bottom", "Left"].some((side) => Number.parseFloat(css[`border${side}Width`]) > 0));
+        });
+        if (!asset && !hasFill && !hasBorder && !hasBackgroundImage && !hasShadow && !hasDecoration) continue;
         if (style.backgroundClip === "text" || style.webkitBackgroundClip === "text") continue;
 
-        const matrix = new DOMMatrixReadOnly(style.transform === "none" ? undefined : style.transform);
-        const rotation = Math.abs(matrix.b) > 0.0001 || Math.abs(matrix.a - 1) > 0.0001
-          ? Math.atan2(matrix.b, matrix.a) * 180 / Math.PI
-          : 0;
+        const rotation = geometry.rotation;
         const radiusValue = (value) => {
           const parsed = Number.parseFloat(value) || 0;
-          return String(value).includes("%") ? minSidePx * parsed / 100 : parsed;
+          return String(value).includes("%") ? minSidePx * parsed / 100 : parsed * Math.min(geometry.scaleX, geometry.scaleY);
         };
         const minSidePx = Math.min(rect.width, rect.height);
         const radii = [
@@ -1003,14 +1065,14 @@ async function extractVisualObjects(page, info, index) {
           style.borderBottomLeftRadius,
         ].map(radiusValue);
         const id = `html2ppt-${targetIndex + 1}-${++sequence}`;
-        const kind = asset ? "asset" : hasBackgroundImage ? "background" : "shape";
+        const kind = asset ? "asset" : hasBackgroundImage || hasDecoration || hasShadow ? "background" : "shape";
         // Native PowerPoint shapes may extend beyond the slide and should keep
         // their original geometry (large circles are often intentionally clipped).
         // Raster captures are clipped to the visible slide/viewport region.
-        const x = kind === "shape" ? rect.left - slideRect.left : clippedX;
-        const y = kind === "shape" ? rect.top - slideRect.top : clippedY;
-        const w = kind === "shape" ? rect.width : clippedW;
-        const h = kind === "shape" ? rect.height : clippedH;
+        const w = kind === "shape" && Math.abs(rotation) > 0.1 ? element.offsetWidth * geometry.scaleX : kind === "shape" ? rect.width : clippedW;
+        const h = kind === "shape" && Math.abs(rotation) > 0.1 ? element.offsetHeight * geometry.scaleY : kind === "shape" ? rect.height : clippedH;
+        const x = kind === "shape" ? rect.left - slideRect.left + (rect.width - w) / 2 : clippedX;
+        const y = kind === "shape" ? rect.top - slideRect.top + (rect.height - h) / 2 : clippedY;
         element.setAttribute("data-html2ppt-visual-id", id);
         if (kind === "asset") element.setAttribute("data-html2ppt-hide-object", "1");
         else element.setAttribute("data-html2ppt-hide-box", "1");
@@ -1025,7 +1087,7 @@ async function extractVisualObjects(page, info, index) {
           fill,
           borders,
           radii,
-          rotation,
+          rotation: kind === "shape" ? rotation : 0,
           opacity,
           backgroundImage,
           objectFit: style.objectFit || "fill",
@@ -1044,7 +1106,7 @@ async function extractVisualObjects(page, info, index) {
   );
 }
 
-async function captureRasterObject(page, visual) {
+export async function captureRasterObject(page, visual) {
   const locator = page.locator(`[data-html2ppt-visual-id="${visual.id}"]`);
   await page.evaluate(
     ({ id, kind }) => {
@@ -1100,6 +1162,17 @@ async function captureRasterObject(page, visual) {
       document.documentElement.setAttribute("data-html2ppt-clean", "1");
       document.documentElement.setAttribute("data-html2ppt-object-capture", kind);
       target.setAttribute("data-html2ppt-capture-target", "1");
+      // activateSlide uses inline visibility:visible!important. A stylesheet
+      // cannot override it, so transparent captures used to include slide fill.
+      globalThis.__html2pptCaptureVisibility = [];
+      for (let ancestor = target.parentElement; ancestor; ancestor = ancestor.parentElement) {
+        globalThis.__html2pptCaptureVisibility.push({
+          element: ancestor,
+          value: ancestor.style.getPropertyValue("visibility"),
+          priority: ancestor.style.getPropertyPriority("visibility"),
+        });
+        ancestor.style.setProperty("visibility", "hidden", "important");
+      }
     },
     { id: visual.id, kind: visual.kind },
   );
@@ -1127,6 +1200,11 @@ async function captureRasterObject(page, visual) {
       }
       document.documentElement.removeAttribute("data-html2ppt-object-capture");
       document.documentElement.removeAttribute("data-html2ppt-clean");
+      for (const saved of globalThis.__html2pptCaptureVisibility || []) {
+        if (saved.value) saved.element.style.setProperty("visibility", saved.value, saved.priority);
+        else saved.element.style.removeProperty("visibility");
+      }
+      delete globalThis.__html2pptCaptureVisibility;
     }, visual.id);
   }
 }
@@ -1145,6 +1223,9 @@ async function captureCleanBackground(page, slideElement) {
       document.querySelectorAll("[data-html2ppt-hide-text]").forEach((element) => {
         element.removeAttribute("data-html2ppt-hide-text");
       });
+      document.querySelectorAll("[data-html2ppt-pseudo-clone]").forEach((element) => element.remove());
+      document.querySelectorAll("[data-html2ppt-pseudo-before]").forEach((element) => element.removeAttribute("data-html2ppt-pseudo-before"));
+      document.querySelectorAll("[data-html2ppt-pseudo-after]").forEach((element) => element.removeAttribute("data-html2ppt-pseudo-after"));
     });
   }
 }
@@ -1181,20 +1262,13 @@ async function captureObjectsBackground(page, slideElement) {
 }
 
 function normalizeFontFace(value) {
-  const first = String(value || "Microsoft YaHei").split(",")[0].trim().replace(/^['"]|['"]$/g, "");
-  const lower = first.toLowerCase();
-  // Web fonts are not embedded in PPTX. Use a Windows serif with similarly
-  // compact numeral metrics so adjacent unit labels stay aligned.
-  if (/crimson pro|adobe arabic/.test(lower)) return "Times New Roman";
-  if (/pingfang|hiragino|noto sans cjk|source han sans|heiti/.test(lower)) return "Microsoft YaHei";
-  if (/noto serif cjk|source han serif|songti/.test(lower)) return "SimSun";
-  if (/monospace/.test(lower)) return "Consolas";
-  if (/sans-serif|system-ui/.test(lower)) return "Microsoft YaHei";
-  if (/serif/.test(lower)) return "SimSun";
-  return first || "Microsoft YaHei";
+  const resolved = resolveFontFace(value, installedFonts);
+  const first = String(value || "").split(",")[0].trim().replace(/^['"]|['"]$/g, "");
+  if (first.toLowerCase() !== resolved.toLowerCase()) fontSubstitutions.set(first, resolved);
+  return resolved;
 }
 
-function addEditableText(slide, block, sourceRect, backgroundBox) {
+export function addEditableText(slide, block, sourceRect, backgroundBox) {
   const sx = backgroundBox.w / sourceRect.width;
   const sy = backgroundBox.h / sourceRect.height;
   const fontSize = Math.max(1, block.fontSize * sx * 72);
@@ -1209,7 +1283,19 @@ function addEditableText(slide, block, sourceRect, backgroundBox) {
 
   const objectName = `HTML text ${block.id}`;
 
-  slide.addText(block.text, {
+  const runs = (block.runs || [block]).map((run) => ({
+    text: run.text,
+    options: {
+      fontFace: normalizeFontFace(run.fontFamily),
+      fontSize: Math.max(1, run.fontSize * sx * 72),
+      bold: Number.parseInt(run.fontWeight, 10) >= 600 || run.fontWeight === "bold",
+      italic: run.fontStyle === "italic" || run.fontStyle === "oblique",
+      color: run.color,
+      transparency: Math.round((1 - (run.opacity ?? 1)) * 100),
+      charSpacing: run.letterSpacing ? run.letterSpacing * sx * 72 : undefined,
+    },
+  }));
+  slide.addText(runs, {
     x,
     y,
     w,
@@ -1217,8 +1303,8 @@ function addEditableText(slide, block, sourceRect, backgroundBox) {
     margin: 0,
     fontFace: normalizeFontFace(block.fontFamily),
     fontSize,
-    bold: Number.parseInt(block.fontWeight, 10) >= 600 || block.fontWeight === "bold",
-    italic: block.fontStyle === "italic" || block.fontStyle === "oblique",
+    bold: false,
+    italic: false,
     color: block.color,
     align: ["center", "right", "justify"].includes(block.align) ? block.align : "left",
     valign: "mid",
@@ -1506,6 +1592,8 @@ async function main() {
   const inputStat = await fs.stat(inputPath).catch(() => null);
   if (!inputStat?.isFile()) throw new Error(`输入文件不存在：${inputPath}`);
   if (path.extname(inputPath).toLowerCase() !== ".html") throw new Error("输入文件必须是 .html");
+  installedFonts = opts.mode === "image" ? null : await discoverInstalledFonts();
+  fontSubstitutions.clear();
 
   const outputPath = path.resolve(
     opts.output || path.join(path.dirname(inputPath), `${safeFileStem(inputPath)}-${opts.mode}.pptx`),
@@ -1545,8 +1633,11 @@ async function main() {
     });
     await waitForAssets(page);
     await installCleanCaptureStyle(page);
+    await installCaptureHelpers(page);
 
     const info = await detectSlides(page, opts.selector);
+    const excluded = await prepareCapturePage(page, info.selector);
+    if (excluded) console.log(`已排除 ${excluded} 个页面外控件或显式忽略元素`);
     const title = (await page.title()) || safeFileStem(inputPath);
     console.log(`识别到 ${info.count} 页，选择器：${info.selector}`);
 
@@ -1557,18 +1648,25 @@ async function main() {
         ? await extractSlideAnimations(page, info, index, opts.animations)
         : [];
       await finishSlideMotion(page, info, index, opts.wait);
+      await waitForAssets(page);
       const slideElement = page.locator(info.selector).nth(index);
       await slideElement.waitFor({ state: "attached" });
       const box = await slideElement.boundingBox();
       if (!box || box.width < 10 || box.height < 10) {
         throw new Error(`第 ${index + 1} 页没有可截图的尺寸`);
       }
+      // These are the complete browser reference frames, before object/text
+      // removal. They are useful for validating the final PowerPoint render.
+      if (imageDir) {
+        const imagePath = path.join(imageDir, `slide-${String(index + 1).padStart(3, "0")}.png`);
+        await slideElement.screenshot({ path: imagePath, animations: "disabled", caret: "hide" });
+      }
       let editable = { slideRect: { width: box.width, height: box.height }, textBlocks: [] };
       let visualObjects = [];
       let png;
       if (opts.mode === "objects") {
-        editable = await extractEditableText(page, info, index);
         visualObjects = await extractVisualObjects(page, info, index);
+        editable = await extractEditableText(page, info, index);
         for (const visual of visualObjects) {
           if (visual.kind === "asset" || visual.kind === "background") {
             visual.png = await captureRasterObject(page, visual);
@@ -1576,6 +1674,8 @@ async function main() {
         }
         png = await captureObjectsBackground(page, slideElement);
       } else if (opts.mode === "editable") {
+        // Materialize text-bearing pseudo-elements before reading text nodes.
+        await extractVisualObjects(page, info, index);
         editable = await extractEditableText(page, info, index);
         png = await captureCleanBackground(page, slideElement);
       } else {
@@ -1587,10 +1687,6 @@ async function main() {
       }
       const dimensions = pngDimensions(png);
       frames.push({ png, dimensions, visualObjects, animations, ...editable });
-      if (imageDir) {
-        const imagePath = path.join(imageDir, `slide-${String(index + 1).padStart(3, "0")}.png`);
-        await fs.writeFile(imagePath, png);
-      }
       const editableLabel = opts.mode === "objects"
         ? `，${editable.textBlocks.length} 个文本框，${visualObjects.length} 个视觉对象`
         : opts.mode === "editable" ? `，${editable.textBlocks.length} 个文本框` : "";
@@ -1704,6 +1800,7 @@ async function main() {
     }
 
     await pptx.writeFile({ fileName: outputPath, compression: true });
+    for (const [source, target] of fontSubstitutions) console.warn(`字体替换：${source} → ${target}`);
     if (captureAnimations) {
       const animationManifest = buildAnimationManifest(frames);
       const directionSummary = summarizeAnimationDirections(animationManifest);
@@ -1721,7 +1818,9 @@ async function main() {
   }
 }
 
-main().catch((error) => {
-  console.error(`转换失败：${error.message}`);
-  process.exitCode = 1;
-});
+if (process.argv[1] && pathToFileURL(path.resolve(process.argv[1])).href === import.meta.url) {
+  main().catch((error) => {
+    console.error(`转换失败：${error.message}`);
+    process.exitCode = 1;
+  });
+}
